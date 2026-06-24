@@ -1,0 +1,47 @@
+version: "3.8"
+
+# Eric — AI OS backend
+# Runs n8n (orchestrator brain) and Chroma (memory store) together
+# on a single free-tier always-on container (Render / Railway / Fly.io).
+#
+# Why bundled: Chroma needs a persistent host anyway, so n8n rides along
+# on the same free instance instead of needing a second paid service.
+# n8n talks to Chroma over localhost:8000 — no public exposure needed for Chroma.
+
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD}
+      - N8N_HOST=${N8N_HOST}
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://${N8N_HOST}/
+      - GENERIC_TIMEZONE=${TIMEZONE:-UTC}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - chroma
+
+  chroma:
+    image: chromadb/chroma:latest
+    restart: unless-stopped
+    # Intentionally NOT exposing this port publicly — n8n reaches it via
+    # the docker network at http://chroma:8000 (rename in workflow if needed,
+    # or use 'localhost' if both run in the SAME container via supervisor).
+    expose:
+      - "8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+
+volumes:
+  n8n_data:
+  chroma_data:

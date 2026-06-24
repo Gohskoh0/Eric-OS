@@ -1,0 +1,92 @@
+{
+  "name": "Eric — Device Command Queue (Windows Agent)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "eric-device-commands",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "poll-webhook",
+      "name": "Windows Agent Polls Here (GET)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-400, 0],
+      "notes": "Auth: checks Authorization: Bearer header against ERIC_DEVICE_TOKEN before returning anything."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check auth header against the shared device token\nconst headers = $input.first().json.headers || {};\nconst auth = headers.authorization || '';\nconst expected = `Bearer ${$env.ERIC_DEVICE_TOKEN}`;\nif (auth !== expected) {\n  return [{ json: { authorized: false } }];\n}\n\n// In production: read from a real queue (n8n Data Store node or Supabase\n// table keyed by device name). This is the read side of that queue.\n// Returns the oldest pending command for 'windows_laptop', or null.\nreturn [{ json: { authorized: true, command: null } }];"
+      },
+      "id": "check-auth-and-fetch",
+      "name": "Check Auth & Fetch Pending Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-180, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.authorized ? ($json.command || { command: null }) : { error: 'unauthorized' } }}"
+      },
+      "id": "respond-poll",
+      "name": "Respond With Pending Command",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [60, 0]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "eric-device-result",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "result-webhook",
+      "name": "Agent Reports Result Here (POST)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-400, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || {};\nreturn [{ json: {\n  logLine: `🤖 *Eric Device Log*\\nDevice: ${body.device}\\nResult: ${body.result}`,\n  chatId: $env.TELEGRAM_CHAT_ID\n} }];"
+      },
+      "id": "build-device-log",
+      "name": "Build Device Result Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-180, 200]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.logLine }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "telegram-device-log",
+      "name": "Send Device Result To Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [60, 200]
+    },
+    {
+      "parameters": { "respondWith": "json", "responseBody": "={{ { ok: true } }}" },
+      "id": "respond-result",
+      "name": "Acknowledge Agent",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [280, 200]
+    }
+  ],
+  "connections": {
+    "Windows Agent Polls Here (GET)": { "main": [[{ "node": "Check Auth & Fetch Pending Command", "type": "main", "index": 0 }]] },
+    "Check Auth & Fetch Pending Command": { "main": [[{ "node": "Respond With Pending Command", "type": "main", "index": 0 }]] },
+    "Agent Reports Result Here (POST)": { "main": [[{ "node": "Build Device Result Log", "type": "main", "index": 0 }]] },
+    "Build Device Result Log": { "main": [[{ "node": "Send Device Result To Telegram", "type": "main", "index": 0 }]] },
+    "Send Device Result To Telegram": { "main": [[{ "node": "Acknowledge Agent", "type": "main", "index": 0 }]] }
+  }
+}

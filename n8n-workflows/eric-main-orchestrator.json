@@ -1,0 +1,415 @@
+{
+  "name": "Eric — Main Orchestrator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "eric-inbound",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-inbound",
+      "name": "Inbound Webhook (Telegram + Lovable)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1400, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize input from either Telegram or Lovable into one shape.\n// Telegram sends: { message: { text, voice, chat: { id } } }\n// Lovable sends: { source: 'lovable', user_id, text, audio_url }\n\nconst body = $input.first().json.body || $input.first().json;\nlet source, chatId, text, audioUrl;\n\nif (body.message) {\n  // Telegram update\n  source = 'telegram';\n  chatId = body.message.chat.id;\n  text = body.message.text || null;\n  audioUrl = body.message.voice ? `TELEGRAM_FILE:${body.message.voice.file_id}` : null;\n} else {\n  // Lovable web app\n  source = 'lovable';\n  chatId = body.user_id || 'lovable-default';\n  text = body.text || null;\n  audioUrl = body.audio_url || null;\n}\n\nreturn [{\n  json: {\n    source,\n    chatId,\n    text,\n    audioUrl,\n    raw: body,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "normalize-input",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1180, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.audioUrl }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "has-audio",
+      "name": "Has audio?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-960, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api-inference.huggingface.co/models/openai/whisper-large-v3",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "audioFile",
+        "options": {}
+      },
+      "id": "whisper-transcribe",
+      "name": "HF Whisper — Speech to Text",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-740, -120],
+      "notes": "Requires the audio binary fetched first (Telegram getFile or Lovable audio_url download). Returns { text: '...' }"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge transcribed text (if audio path) or pass through original text\nconst item = $input.first().json;\nconst transcript = item.text || ($json && $json.text) || '';\nreturn [{ json: { ...item, finalText: transcript } }];"
+      },
+      "id": "merge-text",
+      "name": "Merge Final Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-520, -60]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nreturn [{ json: { ...item, finalText: item.text } }];"
+      },
+      "id": "passthrough-text",
+      "name": "Pass Through Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-740, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Strip wake word 'Eric' if present, keep the command clean\nconst item = $input.first().json;\nlet cmd = (item.finalText || '').trim();\ncmd = cmd.replace(/^(hey |ok |okay )?eric[,:]?\\s*/i, '').trim();\nreturn [{ json: { ...item, command: cmd } }];"
+      },
+      "id": "strip-wakeword",
+      "name": "Strip Wake Word",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-300, 0]
+    },
+    {
+      "parameters": {
+        "url": "=http://localhost:8000/api/v1/collections/eric_memory/query",
+        "method": "POST",
+        "sendBody": true,
+        "jsonBody": "={{ JSON.stringify({ query_texts: [$json.command], n_results: 3 }) }}",
+        "options": {}
+      },
+      "id": "query-chroma",
+      "name": "Query Chroma Memory",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-80, 0],
+      "notes": "Chroma runs as a sidecar on the same host as n8n, reachable on localhost:8000"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the routing prompt: combine command + any relevant past corrections\nconst item = $input.first().json;\nconst chroma = $input.first().json.documents ? $input.first().json : {};\nlet memoryNote = '';\ntry {\n  const docs = (chroma.documents && chroma.documents[0]) || [];\n  if (docs.length) {\n    memoryNote = 'Relevant past corrections:\\n' + docs.join('\\n');\n  }\n} catch (e) {}\n\nreturn [{ json: { ...item, memoryNote } }];"
+      },
+      "id": "build-context",
+      "name": "Build Context With Memory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [140, 0]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "combinator": "or",
+                "conditions": [
+                  { "leftValue": "={{ $json.command.toLowerCase() }}", "rightValue": "build|create|generate|code|app|website|script", "operator": { "type": "string", "operation": "regex" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "codegen"
+            },
+            {
+              "conditions": {
+                "combinator": "or",
+                "conditions": [
+                  { "leftValue": "={{ $json.command.toLowerCase() }}", "rightValue": "deploy|push|publish|ship|release", "operator": { "type": "string", "operation": "regex" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "deploy"
+            },
+            {
+              "conditions": {
+                "combinator": "or",
+                "conditions": [
+                  { "leftValue": "={{ $json.command.toLowerCase() }}", "rightValue": "linkedin|post update|connections", "operator": { "type": "string", "operation": "regex" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "linkedin"
+            },
+            {
+              "conditions": {
+                "combinator": "or",
+                "conditions": [
+                  { "leftValue": "={{ $json.command.toLowerCase() }}", "rightValue": "no that's wrong|correction|actually i meant|fix that|that's not right|remember this instead", "operator": { "type": "string", "operation": "regex" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "correction"
+            },
+            {
+              "conditions": {
+                "combinator": "or",
+                "conditions": [
+                  { "leftValue": "={{ $json.command.toLowerCase() }}", "rightValue": "lock my laptop|lock screen|open (notepad|chrome|vscode|calculator|explorer)|on my laptop|turn on (the )?lights|turn off (the )?lights|lock the door|unlock the door|set a timer|send a text|text me|open maps|on my phone|on my iphone", "operator": { "type": "string", "operation": "regex" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "device"
+            }
+          ]
+        },
+        "options": { "fallbackOutput": "extra" }
+      },
+      "id": "intent-router",
+      "name": "Intent Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [360, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decide whether a device command is for the Windows laptop or the iPhone,\n// and normalize it into an { device, action, params } shape.\nconst item = $input.first().json;\nconst cmd = item.command.toLowerCase();\n\nlet device, action, params = {};\n\nif (/laptop|notepad|chrome|vscode|calculator|explorer|lock screen/.test(cmd)) {\n  device = 'windows_laptop';\n  if (/lock/.test(cmd)) { action = 'lock_screen'; }\n  else if (/open/.test(cmd)) {\n    action = 'open_app';\n    const match = cmd.match(/open (notepad|chrome|vscode|calculator|explorer)/);\n    params = { app: match ? match[1] : 'notepad' };\n  } else { action = 'open_app'; params = { app: 'explorer' }; }\n} else {\n  device = 'iphone';\n  if (/lights/.test(cmd)) { action = /off/.test(cmd) ? 'lights_off' : 'lights_on'; }\n  else if (/lock the door/.test(cmd)) { action = 'lock_home'; }\n  else if (/timer/.test(cmd)) { action = 'set_timer'; params = { duration: '10 minutes' }; }\n  else if (/text/.test(cmd)) { action = 'send_text'; params = { message: cmd }; }\n  else if (/maps/.test(cmd)) { action = 'open_maps'; }\n  else { action = 'unknown'; }\n}\n\nreturn [{ json: { ...item, device, deviceAction: action, deviceParams: params } }];"
+      },
+      "id": "classify-device",
+      "name": "Classify Device Target",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [600, 460]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            { "leftValue": "={{ $json.device }}", "rightValue": "iphone", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "is-iphone",
+      "name": "Target is iPhone?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [820, 460]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.pushcut.io/v1/notifications/eric_action",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "jsonBody": "={{ JSON.stringify({ title: 'Eric', text: 'Running: ' + $json.deviceAction, input: { command: $json.deviceAction, params: $json.deviceParams } }) }}",
+        "options": {}
+      },
+      "id": "pushcut-trigger",
+      "name": "Pushcut — Trigger iPhone Shortcut",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1040, 420],
+      "notes": "Requires Pushcut API key as a header credential. See device-control/ios-shortcuts/SETUP.md"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Push the command into a simple in-memory/DB queue that the\n// Windows agent polls via GET /webhook/eric-device-commands.\n// In production, back this with a tiny key-value store (n8n's own\n// data store node, or a free Supabase table) keyed by device name.\nconst item = $input.first().json;\nreturn [{ json: { ...item, queuedCommandId: 'cmd_' + Date.now() } }];"
+      },
+      "id": "queue-windows-command",
+      "name": "Queue Command For Windows Agent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 520],
+      "notes": "Pairs with GET /webhook/eric-device-commands which the Windows agent polls every 5s, and POST /webhook/eric-device-result which it reports back to."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-Coder-32B-Instruct",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "jsonBody": "={{ JSON.stringify({ inputs: ($json.memoryNote ? $json.memoryNote + \"\\n\\n\" : \"\") + \"Generate complete, production-ready code for this request. Return only file contents, clearly delimited by filename:\\n\\n\" + $json.command, parameters: { max_new_tokens: 4096, temperature: 0.2 } }) }}",
+        "options": { "timeout": 120000 }
+      },
+      "id": "hf-codegen",
+      "name": "HF Code Generation (Qwen2.5-Coder)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [600, -180]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the generated code into discrete files for storage\nconst item = $input.first().json;\nconst generated = Array.isArray(item) ? item[0].generated_text : (item.generated_text || item[0]?.generated_text || JSON.stringify(item));\nconst projectId = 'proj_' + Date.now();\nreturn [{ json: { ...item, projectId, generatedCode: generated } }];"
+      },
+      "id": "parse-codegen",
+      "name": "Parse Generated Code",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [820, -180]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "eric-store-files",
+        "responseMode": "responseNode"
+      },
+      "id": "zapier-store-webhook",
+      "name": "Trigger Zapier — Store Files",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1040, -180],
+      "notes": "Replace URL with your Zapier 'Catch Hook' webhook URL. Zapier then writes to Drive/S3/Airtable."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$json.deployTargetUrl || 'https://api.github.com/repos/YOUR_USERNAME/YOUR_REPO/contents/'}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "options": {}
+      },
+      "id": "github-push",
+      "name": "GitHub — Push Code",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [600, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.vercel.com/v13/deployments",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "options": {}
+      },
+      "id": "vercel-deploy",
+      "name": "Vercel — Deploy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [820, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.linkedin.com/v2/ugcPosts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "jsonBody": "={{ JSON.stringify({ author: 'urn:li:person:YOUR_LINKEDIN_ID', lifecycleState: 'PUBLISHED', specificContent: { 'com.linkedin.ugc.ShareContent': { shareCommentary: { text: $json.command }, shareMediaCategory: 'NONE' } }, visibility: { 'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC' } }) }}",
+        "options": {}
+      },
+      "id": "linkedin-post",
+      "name": "LinkedIn — Post Update",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [600, 220]
+    },
+    {
+      "parameters": {
+        "url": "=http://localhost:8000/api/v1/collections/eric_memory/add",
+        "method": "POST",
+        "sendBody": true,
+        "jsonBody": "={{ JSON.stringify({ documents: [$json.command], ids: ['corr_' + Date.now()], metadatas: [{ timestamp: $json.timestamp, source: $json.source }] }) }}",
+        "options": {}
+      },
+      "id": "write-chroma",
+      "name": "Write Correction to Chroma",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [600, 380]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a unified log entry for every single thing Eric does\nconst item = $input.first().json;\nreturn [{ json: {\n  logLine: `🤖 *Eric Log*\\nSource: ${item.source}\\nCommand: ${item.command || item.finalText}\\nAction: ${item.actionTaken || 'processed'}\\nStatus: ${item.status || 'ok'}\\nTime: ${item.timestamp}`,\n  chatId: item.chatId\n} }];"
+      },
+      "id": "build-log",
+      "name": "Build Telegram Log Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 100]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.logLine }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "telegram-log",
+      "name": "Send Log To Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1260, 100],
+      "notes": "ALL paths converge here. This node fires for every interaction, success, or failure — nothing happens silently."
+    },
+    {
+      "parameters": { "respondWith": "json", "responseBody": "={{ { ok: true, projectId: $json.projectId || null } }}" },
+      "id": "webhook-response",
+      "name": "Respond to Caller",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1480, 100]
+    }
+  ],
+  "connections": {
+    "Inbound Webhook (Telegram + Lovable)": { "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]] },
+    "Normalize Input": { "main": [[{ "node": "Has audio?", "type": "main", "index": 0 }]] },
+    "Has audio?": {
+      "main": [
+        [{ "node": "HF Whisper — Speech to Text", "type": "main", "index": 0 }],
+        [{ "node": "Pass Through Text", "type": "main", "index": 0 }]
+      ]
+    },
+    "HF Whisper — Speech to Text": { "main": [[{ "node": "Merge Final Text", "type": "main", "index": 0 }]] },
+    "Merge Final Text": { "main": [[{ "node": "Strip Wake Word", "type": "main", "index": 0 }]] },
+    "Pass Through Text": { "main": [[{ "node": "Strip Wake Word", "type": "main", "index": 0 }]] },
+    "Strip Wake Word": { "main": [[{ "node": "Query Chroma Memory", "type": "main", "index": 0 }]] },
+    "Query Chroma Memory": { "main": [[{ "node": "Build Context With Memory", "type": "main", "index": 0 }]] },
+    "Build Context With Memory": { "main": [[{ "node": "Intent Router", "type": "main", "index": 0 }]] },
+    "Intent Router": {
+      "main": [
+        [{ "node": "HF Code Generation (Qwen2.5-Coder)", "type": "main", "index": 0 }],
+        [{ "node": "GitHub — Push Code", "type": "main", "index": 0 }],
+        [{ "node": "LinkedIn — Post Update", "type": "main", "index": 0 }],
+        [{ "node": "Write Correction to Chroma", "type": "main", "index": 0 }],
+        [{ "node": "Classify Device Target", "type": "main", "index": 0 }],
+        [{ "node": "Build Telegram Log Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Classify Device Target": { "main": [[{ "node": "Target is iPhone?", "type": "main", "index": 0 }]] },
+    "Target is iPhone?": {
+      "main": [
+        [{ "node": "Pushcut — Trigger iPhone Shortcut", "type": "main", "index": 0 }],
+        [{ "node": "Queue Command For Windows Agent", "type": "main", "index": 0 }]
+      ]
+    },
+    "Pushcut — Trigger iPhone Shortcut": { "main": [[{ "node": "Build Telegram Log Message", "type": "main", "index": 0 }]] },
+    "Queue Command For Windows Agent": { "main": [[{ "node": "Build Telegram Log Message", "type": "main", "index": 0 }]] },
+    "HF Code Generation (Qwen2.5-Coder)": { "main": [[{ "node": "Parse Generated Code", "type": "main", "index": 0 }]] },
+    "Parse Generated Code": { "main": [[{ "node": "Trigger Zapier — Store Files", "type": "main", "index": 0 }]] },
+    "Trigger Zapier — Store Files": { "main": [[{ "node": "Build Telegram Log Message", "type": "main", "index": 0 }]] },
+    "GitHub — Push Code": { "main": [[{ "node": "Vercel — Deploy", "type": "main", "index": 0 }]] },
+    "Vercel — Deploy": { "main": [[{ "node": "Build Telegram Log Message", "type": "main", "index": 0 }]] },
+    "LinkedIn — Post Update": { "main": [[{ "node": "Build Telegram Log Message", "type": "main", "index": 0 }]] },
+    "Write Correction to Chroma": { "main": [[{ "node": "Build Telegram Log Message", "type": "main", "index": 0 }]] },
+    "Build Telegram Log Message": { "main": [[{ "node": "Send Log To Telegram", "type": "main", "index": 0 }]] },
+    "Send Log To Telegram": { "main": [[{ "node": "Respond to Caller", "type": "main", "index": 0 }]] }
+  }
+}
